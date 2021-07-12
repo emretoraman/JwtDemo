@@ -1,4 +1,5 @@
 ﻿using JwtDemo.Constants;
+using JwtDemo.Data;
 using JwtDemo.Models;
 using JwtDemo.Settings;
 using Microsoft.AspNetCore.Identity;
@@ -9,6 +10,7 @@ using System.Collections.Generic;
 using System.IdentityModel.Tokens.Jwt;
 using System.Linq;
 using System.Security.Claims;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
 using static JwtDemo.Constants.Authorization;
@@ -19,11 +21,13 @@ namespace JwtDemo.Services
     {
         private readonly UserManager<ApplicationUser> _userManager;
         private readonly Jwt _jwt;
+        private readonly ApplicationDbContext _context;
 
-        public UserService(UserManager<ApplicationUser> userManager, IOptions<Jwt> jwt)
+        public UserService(UserManager<ApplicationUser> userManager, IOptions<Jwt> jwt, ApplicationDbContext context)
         {
             _userManager = userManager;
             _jwt = jwt.Value;
+            _context = context;
         }
 
         public async Task<string> Register(RegisterRequest request)
@@ -62,13 +66,57 @@ namespace JwtDemo.Services
                 return new TokenResponse { Message = "Incorrect credentials" };
             }
 
+            RefreshToken refreshToken = user.RefreshTokens.FirstOrDefault(t => t.IsActive);
+            if (refreshToken == null)
+            {
+                refreshToken = CreateRefreshToken();
+                user.RefreshTokens.Add(refreshToken);
+                _context.Update(user);
+                await _context.SaveChangesAsync();
+            }
+
             return new TokenResponse
             {
                 IsAuthenticated = true,
                 UserName = user.UserName,
                 Email = user.Email,
                 Roles = (await _userManager.GetRolesAsync(user)).ToList(),
-                Token = new JwtSecurityTokenHandler().WriteToken(await CreateJwtToken(user))
+                Token = new JwtSecurityTokenHandler().WriteToken(await CreateJwtToken(user)),
+                RefreshToken = refreshToken.Token,
+                RefreshTokenExpiration = refreshToken.Expires
+            };
+        }
+
+        public async Task<TokenResponse> GetToken(string refreshToken)
+        {
+            ApplicationUser user = _context.Users.SingleOrDefault(u => u.RefreshTokens.Any(t => t.Token == refreshToken));
+            if (user == null)
+            {
+                return new TokenResponse { Message = "Token did not match any users" };
+            }
+
+            RefreshToken currentRefreshToken = user.RefreshTokens.Single(t => t.Token == refreshToken);
+            if (!currentRefreshToken.IsActive)
+            {
+                return new TokenResponse { Message = "Token is not active" };
+            }
+
+            currentRefreshToken.Revoked = DateTime.UtcNow;
+
+            RefreshToken newRefreshToken = CreateRefreshToken();
+            user.RefreshTokens.Add(newRefreshToken);
+            _context.Update(user);
+            await _context.SaveChangesAsync();
+
+            return new TokenResponse
+            {
+                IsAuthenticated = true,
+                UserName = user.UserName,
+                Email = user.Email,
+                Roles = (await _userManager.GetRolesAsync(user)).ToList(),
+                Token = new JwtSecurityTokenHandler().WriteToken(await CreateJwtToken(user)),
+                RefreshToken = newRefreshToken.Token,
+                RefreshTokenExpiration = newRefreshToken.Expires
             };
         }
 
@@ -90,6 +138,47 @@ namespace JwtDemo.Services
             return $"Added {request.Role} to user {request.Email}";
         }
 
+        public async Task<ApplicationUser> GetById(string id)
+        {
+            return await _context.Users.FindAsync(id);
+        }
+
+        public async Task<string> RevokeToken(string token)
+        {
+            ApplicationUser user = _context.Users.SingleOrDefault(u => u.RefreshTokens.Any(t => t.Token == token));
+            if (user == null)
+            {
+                return "Token did not match any users";
+            }
+
+            RefreshToken currentRefreshToken = user.RefreshTokens.Single(t => t.Token == token);
+            if (!currentRefreshToken.IsActive)
+            {
+                return "Token is not active";
+            }
+
+            currentRefreshToken.Revoked = DateTime.UtcNow;
+            _context.Update(user);
+            await _context.SaveChangesAsync();
+
+            return "Token revoked";
+        }
+
+        private static RefreshToken CreateRefreshToken()
+        {
+            byte[] randomNumber = new byte[32];
+
+            using RNGCryptoServiceProvider generator = new();
+            generator.GetBytes(randomNumber);
+
+            return new RefreshToken
+            {
+                Token = Convert.ToBase64String(randomNumber),
+                Expires = DateTime.UtcNow.AddDays(10),
+                Created = DateTime.UtcNow
+            };
+        }
+
         private async Task<JwtSecurityToken> CreateJwtToken(ApplicationUser user)
         {
             IList<Claim> userClaims = await _userManager.GetClaimsAsync(user);
@@ -97,7 +186,7 @@ namespace JwtDemo.Services
             IList<string> roles = await _userManager.GetRolesAsync(user);
             List<Claim> roleClaims = roles.Select(r => new Claim("roles", r)).ToList();
 
-            var claims =
+            IEnumerable<Claim> claims =
                 new[]
                 {
                     new Claim(JwtRegisteredClaimNames.Sub, user.UserName),

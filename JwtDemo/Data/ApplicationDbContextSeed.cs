@@ -26,6 +26,7 @@ namespace JwtDemo.Data
                 };
                 await userManager.CreateAsync(user, DefaultPassword);
                 await userManager.AddToRoleAsync(user, DefaultRole.ToString());
+                await userManager.AddToRoleAsync(user, Role.Administrator.ToString());
             }
         }
     }
